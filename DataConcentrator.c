@@ -21,6 +21,8 @@
 #include <netdb.h>
 #include <sys/types.h>
 #include <gpio.h>
+#include <error.h>
+#include <poll.h>
 
 /***************************************** PROTOTYPES **********************************/
 int main(int argc, char *argv[]);
@@ -32,12 +34,11 @@ void InitSensors (void);
 void InitSensorDataPackets (void);
 void ReflectSensorDataUpdate (void);
 void InitSensorDataIndications (void);
+void InitNetworkStatusIndication (void);
+void UpdateNetworkLed (char * pCmd);
 
 
 /**************************** SYSTEM CALL RETURN TYPES ********************************/
-#define handle_error(msg) \
-           do { perror(msg); exit(EXIT_FAILURE); } while (0)
-
 typedef enum
 {
 	RETVAL_ERR_SOCKETS = -1,
@@ -97,8 +98,6 @@ sSensorDataPacket_t SensorDataPackets[DATA_PACKET_TOTAL_SENSORS];
 /************************************* HW CONFIGURATION ********************************/
 #define SENSOR_DATA_INDICATION_1 0
 #define SENSOR_DATA_INDICATION_2 1
-#define SENSOR_DATA_INDICATION_3 2
-#define SENSOR_DATA_INDICATION_4 3
 
 typedef enum
 {
@@ -108,8 +107,38 @@ typedef enum
 	HUMIDITY_SENSOR_2_ADC = 1
 }eHumiditySensorGpio;
 
+/************************************* NETWORK LED CONTROL *****************************/
+#define NETWORK_STATUS_INDICATION_1				2
+#define NETWORK_STATUS_INDICATION_2 			3
+
+#define NETWORK_STATUS_UNINITIALIZED			"none"
+#define NETWORK_STATUS_SOCKET_INITIALIZED		"default-on"
+#define NETWORK_STATUS_SOCKET_FAILED			"none"
+#define NETWORK_STATUS_CONNECTED				"heartbeat"
+#define NETWORK_STATUS_CONNECTION_TIMEOUT		"default-on"
+#define NETWORK_STATUS_CONNECTION_REFUSED		"default-on"
+#define NETWORK_STATUS_CONNECTION_BREAK			"default-on"
+
 
 /************************************* THREADS and APIs ********************************/
+
+/*
+ * Update Network LED status
+ */
+void UpdateNetworkLed (char * pCmd)
+{
+	write_trigger_values (NETWORK_STATUS_INDICATION_1, pCmd);
+	write_trigger_values (NETWORK_STATUS_INDICATION_2, pCmd);
+}
+
+/*
+ * Initialize Network Status indications
+ */
+void InitNetworkStatusIndication (void)
+{
+	write_trigger_values (NETWORK_STATUS_INDICATION_1, "none");
+	write_trigger_values (NETWORK_STATUS_INDICATION_2, "none");
+}
 
 /*
  * Network Thread, Shall connect with Gateway and send data collected by the sensors every 5 seconds.
@@ -117,43 +146,115 @@ typedef enum
 void* networkThread (void * arg)
 {
 	int clientSocket_fd;
-	char bufferOut[NETWORK_BUFFER_TOTAL_LEN];
 	uint16_t OutBuffLen = 0;
 	struct sockaddr_in name;
+	char bufferOut[NETWORK_BUFFER_TOTAL_LEN];
+    int retVal = 0;
+    int interimConnectionBreak = 0;
 
-	// Create socket
-	clientSocket_fd = socket (PF_INET, SOCK_STREAM, 0);
-	if (clientSocket_fd == RETVAL_ERR_SOCKETS)
-	{
-		printf("\nNetwork Thread failed to create Socket ! Entering dead loop...");
-		for (;;){sleep(5);}
-	}
-	printf ("\n\rCreated socket");
+    int nfds;
+    struct pollfd pollStruct;
+    struct pollfd *pfds = &pollStruct;
 
-	// Store server address in Socket
-	memset(&name, 0, sizeof(name));
-	name.sin_family = AF_INET;
-	name.sin_addr.s_addr = inet_addr("192.168.1.103");
-	name.sin_port = 2017;
-	printf ("\n\rConnecting to server...");
+    InitNetworkStatusIndication ();
+	//sleep(10);
 
-	// Connect to the Server
-	if (RETVAL_ERR_SOCKETS == connect (clientSocket_fd, (struct sockaddr*) &name, sizeof(name)))
-	{
-		printf("\nNetwork Thread failed to connect to server ! Entering dead loop...");
-		for (;;){sleep(5);}
-	}
-
-	printf ("\n\rConnection to server successful ");
-	// Once connected to the Sensor, Fetch data every 5 seconds.
 	for (;;)
 	{
-		// Prepare Sensor Data packets
-		Prepare_SensorDataPackets (bufferOut, &OutBuffLen);
-		bufferOut[NETWORK_BUFFER_TOTAL_LEN-1] = '\0';
-		write (clientSocket_fd, bufferOut, strlen(bufferOut));
+		UpdateNetworkLed (NETWORK_STATUS_UNINITIALIZED);
+		// Create socket
+		clientSocket_fd = socket (PF_INET, SOCK_STREAM, 0);
+		if (clientSocket_fd == RETVAL_ERR_SOCKETS)
+		{
+			printf("\nNetwork Thread failed to create Socket ! Entering dead loop...");
+			UpdateNetworkLed (NETWORK_STATUS_SOCKET_FAILED);
+			for (;;){sleep(5);}
+		}
+		printf ("\n\rCreated socket");
+		UpdateNetworkLed (NETWORK_STATUS_SOCKET_INITIALIZED);
 
-		sleep (5);
+		// Store server address in Socket
+		memset(&name, 0, sizeof(name));
+		name.sin_family = AF_INET;
+		name.sin_addr.s_addr = inet_addr("192.168.1.103");
+		name.sin_port = 2017;
+		printf ("\n\rConnecting to server...");
+
+	//for (;;)
+	//{
+		// Connect to the Server
+		if (RETVAL_ERR_SOCKETS == connect (clientSocket_fd, (struct sockaddr*) &name, sizeof(name)))
+		{
+			printf("\n\rNetwork Thread failed to connect to server ! Checking failure...");
+			perror("\n\rError: ");
+			close (clientSocket_fd);
+
+			switch (errno)
+			{
+
+			case ETIMEDOUT:
+				UpdateNetworkLed (NETWORK_STATUS_CONNECTION_TIMEOUT);
+				break;
+
+			default:
+				UpdateNetworkLed (NETWORK_STATUS_CONNECTION_REFUSED);
+				break;
+			}
+
+			printf ("\n\rRetrying Connection to server in 10 seconds...");
+			sleep (10);
+			continue;
+		}
+		//}
+
+		printf ("\n\rConnection to server successful ");
+		UpdateNetworkLed (NETWORK_STATUS_CONNECTED);
+		interimConnectionBreak = 0;
+
+
+		pfds->fd = clientSocket_fd;
+		pfds->events = (POLLIN | POLLOUT | POLLHUP | POLLERR);
+		pfds->revents = 0;
+		nfds = 1;
+
+		// Once connected to the Sensor, Fetch data every 5 seconds.
+		for (;;)
+		{
+			poll(pfds, nfds, -1); // Wait for events on Socket
+
+			if ((pfds->revents & POLLHUP) || (pfds->revents & POLLERR))
+			{
+				printf ("\n\r POLLHUP");
+				pfds->revents = 0;
+				printf ("\n\rDetected Connection break !");
+				interimConnectionBreak = 1;
+				break;
+			}
+			else if (pfds->revents & POLLOUT)
+			{
+				printf ("\n\r POLLOUT");
+
+				// Prepare Sensor Data packets every 10 seconds
+				Prepare_SensorDataPackets (bufferOut, &OutBuffLen);
+				bufferOut[NETWORK_BUFFER_TOTAL_LEN-1] = '\0';
+				write (clientSocket_fd, bufferOut, strlen(bufferOut));
+				pfds->revents = 0;
+				sleep (10);
+			}
+			else
+			{
+				printf ("\n\r Other.. %d", pfds->revents);
+				pfds->revents = 0;
+			}
+		}
+
+		if (interimConnectionBreak)
+		{
+			close (clientSocket_fd);
+			UpdateNetworkLed (NETWORK_STATUS_CONNECTION_BREAK);
+			printf ("\n\rRetrying Connection to server in 10 seconds...");
+			sleep (10);
+		}
 	}
 }
 
@@ -253,15 +354,11 @@ void ReflectSensorDataUpdate (void)
 	{
 		write_trigger_values (SENSOR_DATA_INDICATION_1, "default-on");
 		write_trigger_values (SENSOR_DATA_INDICATION_2, "default-on");
-		write_trigger_values (SENSOR_DATA_INDICATION_3, "default-on");
-		write_trigger_values (SENSOR_DATA_INDICATION_4, "default-on");
 	}
 	else
 	{
 		write_trigger_values (SENSOR_DATA_INDICATION_1, "none");
 		write_trigger_values (SENSOR_DATA_INDICATION_2, "none");
-		write_trigger_values (SENSOR_DATA_INDICATION_3, "none");
-		write_trigger_values (SENSOR_DATA_INDICATION_4, "none");
 	}
 }
 
@@ -272,8 +369,6 @@ void InitSensorDataIndications (void)
 {
 	write_trigger_values (SENSOR_DATA_INDICATION_1, "none");
 	write_trigger_values (SENSOR_DATA_INDICATION_2, "none");
-	write_trigger_values (SENSOR_DATA_INDICATION_3, "none");
-	write_trigger_values (SENSOR_DATA_INDICATION_4, "none");
 }
 
 
@@ -303,7 +398,7 @@ int main( int argc, char *argv[] )
     	printf("\n\n\r");
     	ReadSensor_Digital ();
     	ReadSensor_Analog ();
-    	sleep(2);
+    	sleep(5);
     }
     return 0;
 }
